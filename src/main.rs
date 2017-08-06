@@ -222,6 +222,7 @@ fn main() {
         .expect("Subcommand outdated not found");
     let options = Options::from_matches(&m);
     let result = execute(options, &config);
+    // TODO: user-specified exit code
     match result {
         Err(e) => cargo::exit_with_error(e, &mut *config.shell()),
         Ok(()) => {}
@@ -238,26 +239,26 @@ pub fn execute(options: Options, config: &Config) -> CliResult {
     )?;
 
     let curr_workspace = {
-        let curr_manifest = find_root_manifest_for_wd(options.flag_manifest_path, config.cwd())?;
+        let curr_manifest =
+            find_root_manifest_for_wd(options.flag_manifest_path.clone(), config.cwd())?;
         Workspace::new(&curr_manifest, config)?
     };
-    let curr_specs = Packages::All.into_package_id_specs(&curr_workspace)?;
-    let (curr_packages, curr_resolve) = ops::resolve_ws_precisely(
-        &curr_workspace,
-        None,
-        &options.flag_features,
-        options.flag_all_features,
-        options.flag_no_default_features,
-        &curr_specs,
-    )?;
 
-    let compat_proj = TempProject::from_workspace(&curr_workspace, &config)?;
+    let mut compat_proj = TempProject::from_workspace(&curr_workspace, &config)?;
     compat_proj.write_manifest_semver()?;
-    compat_proj.cargo_update()?;
+    compat_proj.cargo_update(&config)?;
 
-    let latest_proj = TempProject::from_workspace(&curr_workspace, &config)?;
+    let mut latest_proj = TempProject::from_workspace(&curr_workspace, &config)?;
     latest_proj.write_manifest_latest()?;
-    latest_proj.cargo_update()?;
+    latest_proj.cargo_update(&config)?;
+
+    cargo_ops::compare_versions(
+        &curr_workspace,
+        &compat_proj.workspace,
+        &latest_proj.workspace,
+        &options,
+        &config,
+    )?;
 
     Ok(())
 }

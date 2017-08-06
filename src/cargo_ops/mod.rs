@@ -7,9 +7,10 @@ use std::error::Error;
 use tempdir::TempDir;
 use toml::Value;
 use toml::value::Table;
-use cargo::core::{Package, PackageId, Workspace};
+use cargo::core::{Package, PackageId, PackageIdSpec, PackageSet, Resolve, Workspace};
 use cargo::ops::{self, Packages};
 use cargo::util::{CargoError, CargoErrorKind, CargoResult, Config};
+use cargo::util::graph::{Graph, Nodes};
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Manifest {
@@ -30,7 +31,7 @@ struct Manifest {
     pub target: Option<Table>,
 }
 
-pub fn opt_tables_last<'a, S>(data: &'a Option<Table>, serializer: S) -> Result<S::Ok, S::Error>
+pub fn opt_tables_last<'tbl, S>(data: &'tbl Option<Table>, serializer: S) -> Result<S::Ok, S::Error>
 where
     S: ::serde::ser::Serializer,
 {
@@ -40,16 +41,16 @@ where
     }
 }
 
-pub struct TempProject<'a> {
-    pub workspace: Workspace<'a>,
-    temp_dir: TempDir,
+pub struct TempProject<'tmp> {
+    pub workspace: Workspace<'tmp>,
+    pub temp_dir: TempDir,
 }
 
-impl<'a> TempProject<'a> {
+impl<'tmp> TempProject<'tmp> {
     pub fn from_workspace(
         orig_workspace: &Workspace,
-        config: &'a Config,
-    ) -> CargoResult<TempProject<'a>> {
+        config: &'tmp Config,
+    ) -> CargoResult<TempProject<'tmp>> {
         let workspace_root = orig_workspace.root().to_str().ok_or_else(|| {
             CargoError::from_kind(CargoErrorKind::Msg(format!(
                 "Invalid character found in path {}",
@@ -95,13 +96,12 @@ path = \"test.rs\"
         })
     }
 
-    pub fn cargo_update(&self) -> CargoResult<()> {
+    pub fn cargo_update(&mut self, config: &'tmp Config) -> CargoResult<()> {
+        let root_manifest = String::from(self.workspace.root().to_string_lossy()) + "/Cargo.toml";
         if let Err(e) = process::Command::new("cargo")
             .arg("update")
             .arg("--manifest-path")
-            .arg(
-                &(String::from(self.workspace.root().to_string_lossy()) + "/Cargo.toml"),
-            )
+            .arg(&root_manifest)
             .output()
             .and_then(|v| if v.status.success() {
                 Ok(v)
@@ -116,6 +116,7 @@ path = \"test.rs\"
                 e.description()
             ))));
         }
+        self.workspace = Workspace::new(Path::new(&root_manifest), config)?;
         Ok(())
     }
 
@@ -228,4 +229,129 @@ path = \"test.rs\"
             }
         }
     }
+}
+
+pub fn elaborate_workspace<'elb>(
+    workspace: &'elb Workspace,
+    options: &super::Options,
+) -> CargoResult<(Vec<PackageIdSpec>, PackageSet<'elb>, Resolve)> {
+    let specs = Packages::All.into_package_id_specs(&workspace)?;
+    let (packages, resolve) = ops::resolve_ws_precisely(
+        &workspace,
+        None,
+        &options.flag_features,
+        options.flag_all_features,
+        options.flag_no_default_features,
+        &specs,
+    )?;
+    Ok((specs, packages, resolve))
+}
+
+pub fn compare_versions(
+    curr: &Workspace,
+    compat: &Workspace,
+    latest: &Workspace,
+    options: &super::Options,
+    config: &Config,
+) -> CargoResult<()> {
+    let (curr_specs, curr_pkgs, curr_resolv) = elaborate_workspace(curr, options)?;
+    let (compat_specs, compat_pkgs, compat_resolv) = elaborate_workspace(compat, options)?;
+    let (latest_specs, latest_pkgs, latest_resolv) = elaborate_workspace(compat, options)?;
+
+    let curr_root = curr.current()?.package_id();
+    let compat_root = compat.current()?.package_id();
+    let latest_root = compat.current()?.package_id();
+
+    compare_versions_recursive(
+        &curr_root,
+        &curr_pkgs,
+        &curr_resolv,
+        Some(&compat_root),
+        &compat_pkgs,
+        &compat_resolv,
+        Some(&latest_root),
+        &latest_pkgs,
+        &latest_resolv,
+    )?;
+
+    Ok(())
+}
+
+fn compare_versions_recursive(
+    curr_root: &PackageId,
+    curr_pkgs: &PackageSet,
+    curr_resolv: &Resolve,
+    compat_root: Option<&PackageId>,
+    compat_pkgs: &PackageSet,
+    compat_resolv: &Resolve,
+    latest_root: Option<&PackageId>,
+    latest_pkgs: &PackageSet,
+    latest_resolv: &Resolve,
+) -> CargoResult<()> {
+    let compat_version = match compat_root {
+        Some(compat_root) => {
+            let v = compat_pkgs.get(compat_root)?.version();
+            if v != curr_pkgs.get(curr_root)?.version() {
+                Some(v.to_string())
+            } else {
+                None
+            }
+        }
+        None => Some("  RM  ".to_owned()),
+    };
+    let latest_version = match latest_root {
+        Some(latest_root) => {
+            let v = latest_pkgs.get(latest_root)?.version();
+            if v != curr_pkgs.get(curr_root)?.version() {
+                Some(v.to_string())
+            } else {
+                None
+            }
+        }
+        None => Some("  RM  ".to_owned()),
+    };
+    let curr_name = curr_pkgs.get(curr_root)?.name();
+    if compat_version.is_some() || latest_version.is_some() {
+        println!(
+            "{} {} {}",
+            curr_name,
+            compat_version.unwrap_or_else(|| "  --  ".to_owned()),
+            latest_version.unwrap_or_else(|| "  --  ".to_owned())
+        );
+    }
+
+    for dep in curr_resolv.deps(curr_root) {
+        let dep_pkg = curr_pkgs.get(dep)?;
+        let dep_name = dep_pkg.name();
+        let next_compat_root =
+            compat_root.and_then(|i| find_dep_by_name(dep_name, i, compat_resolv));
+        let next_latest_root =
+            latest_root.and_then(|i| find_dep_by_name(dep_name, i, latest_resolv));
+        compare_versions_recursive(
+            dep_pkg.package_id(),
+            curr_pkgs,
+            curr_resolv,
+            next_compat_root,
+            compat_pkgs,
+            compat_resolv,
+            next_latest_root,
+            latest_pkgs,
+            latest_resolv,
+        )?;
+    }
+
+    Ok(())
+}
+
+fn find_dep_by_name<'fin>(
+    name: &str,
+    pkg: &PackageId,
+    resolv: &'fin Resolve,
+) -> Option<&'fin PackageId> {
+    for dep in resolv.deps(pkg) {
+        if dep.name() == name {
+            return Some(dep);
+        }
+    }
+    None
 }

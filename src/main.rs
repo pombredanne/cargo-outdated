@@ -1,79 +1,3 @@
-//! A cargo subcommand for checking the latest version on crates.io of a particular dependency
-//!
-//! ## About
-//!
-//! `cargo-outdated` is a very early proof-of-concept for displaying when dependencies have newer versions available.
-//!
-//! ## Compiling
-//!
-//! Follow these instructions to compile `cargo-outdated`, then skip down to Installation.
-//!
-//! 1. Ensure you have current version of `cargo` and [Rust](https://www.rust-lang.org) installed
-//! 2. Clone the project `$ git clone https://github.com/kbknapp/cargo-outdated && cd cargo-outdated`
-//! 3. Build the project `$ cargo build --release`
-//! 4. Once complete, the binary will be located at `target/release/cargo-outdated`
-//!
-//! ## Installation and Usage
-//!
-//! All you need to do is place `cargo-outdated` somewhere in your `$PATH`. Then run `cargo outdated` anywhere in your project directory. For full details see below.
-//!
-//! ### Linux / OS X
-//!
-//! You have two options, place `cargo-outdated` into a directory that is already located in your `$PATH` variable (To see which directories those are, open a terminal and type `echo "${PATH//:/\n}"`, the quotation marks are important), or you can add a custom directory to your `$PATH`
-//!
-//! **Option 1**
-//! If you have write permission to a directory listed in your `$PATH` or you have root permission (or via `sudo`), simply copy the `cargo-outdated` to that directory `# sudo cp cargo-outdated /usr/local/bin`
-//!
-//! **Option 2**
-//! If you do not have root, `sudo`, or write permission to any directory already in `$PATH` you can create a directory inside your home directory, and add that. Many people use `$HOME/.bin` to keep it hidden (and not clutter your home directory), or `$HOME/bin` if you want it to be always visible. Here is an example to make the directory, add it to `$PATH`, and copy `cargo-outdated` there.
-//!
-//! Simply change `bin` to whatever you'd like to name the directory, and `.bashrc` to whatever your shell startup file is (usually `.bashrc`, `.bash_profile`, or `.zshrc`)
-//!
-//! ```ignore
-//! $ mkdir ~/bin
-//! $ echo "export PATH=$PATH:$HOME/bin" >> ~/.bashrc
-//! $ cp cargo-outdated ~/bin
-//! $ source ~/.bashrc
-//! ```
-//!
-//! ### Windows
-//!
-//! On Windows 7/8 you can add directory to the `PATH` variable by opening a command line as an administrator and running
-//!
-//! ```ignore
-//! C:\> setx path "%path%;C:\path\to\cargo-outdated\binary"
-//! ```
-//!
-//! Otherwise, ensure you have the `cargo-outdated` binary in the directory which you operating in the command line from, because Windows automatically adds your current directory to PATH (i.e. if you open a command line to `C:\my_project\` to use `cargo-outdated` ensure `cargo-outdated.exe` is inside that directory as well).
-//!
-//!
-//! ### Options
-//!
-//! There are a few options for using `cargo-outdated` which should be somewhat self explanitory.
-//!
-//! ```ignore
-//! USAGE:
-//!     cargo outdated [FLAGS] [OPTIONS]
-//!
-//! FLAGS:
-//!     -h, --help              Prints help information
-//!     -R, --root-deps-only    Only check root dependencies (Equivalent to --depth=1)
-//!     -V, --version           Prints version information
-//!     -v, --verbose           Print verbose output
-//!
-//! OPTIONS:
-//!     -d, --depth <NUM>             How deep in the dependency chain to search (Defaults to all dependencies when omitted)
-//!         --exit-code <NUM>         The exit code to return on new versions found [default: 0]
-//!     -l, --lockfile-path <PATH>    An absolute path to the Cargo.lock to use (Defaults to Cargo.lock in project root)
-//!     -m, --manifest-path <PATH>    An absolute path to the Cargo.toml to use (Defaults to Cargo.toml in project root)
-//!     -p, --package <PKG>...        Package to inspect for updates
-//!     -r, --root <ROOT>             Package to treat as the root package
-//! ```
-//!
-//! ## License
-//!
-//! `cargo-outdated` is released under the terms of the MIT license. See the LICENSE-MIT file for the details.
-
 #[macro_use]
 extern crate clap;
 extern crate toml;
@@ -84,170 +8,258 @@ extern crate tabwriter;
 extern crate serde;
 #[macro_use]
 extern crate serde_derive;
+extern crate cargo;
+extern crate env_logger;
 
-#[macro_use]
-mod macros;
-mod config;
-mod error;
-mod fmt;
-mod util;
-mod cargo_files;
 mod cargo_ops;
+use cargo_ops::TempProject;
 
-use std::io::{Write, stdout};
 use std::path::Path;
-#[cfg(feature="debug")]
-use std::env;
-use std::process;
 
-use clap::{App, AppSettings, Arg, SubCommand, ArgMatches};
+use cargo::core::{Package, PackageId, Workspace};
+use cargo::core::shell::{ColorConfig, Shell, Verbosity};
+use cargo::ops::{self, Packages};
+use cargo::util::important_paths::find_root_manifest_for_wd;
+use cargo::util::{CargoError, CargoErrorKind, CargoResult, CliError, CliResult, Config};
+use clap::{App, AppSettings, Arg, ArgMatches, SubCommand};
 use tabwriter::TabWriter;
 
-use config::Config;
-use error::{CliResult, CliError};
-use fmt::Format;
+#[derive(Deserialize, Debug)]
+pub struct Options {
+    flag_color: Option<String>,
+    flag_features: Vec<String>,
+    flag_all_features: bool,
+    flag_no_default_features: bool,
+    flag_manifest_path: Option<String>,
+    flag_quiet: Option<bool>,
+    flag_verbose: u32,
+    flag_frozen: bool,
+    flag_locked: bool,
+    flag_exit_code: u32,
+    flag_packages: Vec<String>,
+    flag_root: Option<String>,
+}
 
-fn main() {
-    debugln!("main:args={:?}", env::args().collect::<Vec<_>>());
-    let m = App::new("cargo-outdated")
-        .author("Kevin K. <kbknapp@gmail.com>")
-        .about("Displays information about project dependency versions")
-        .version(concat!("v", crate_version!()))
-        // We have to lie about our binary name since this will be a third party
-        // subcommand for cargo
-        .bin_name("cargo")
-        // Global version uses the version we supplied (Cargo.toml) for all subcommands
-        // as well
-        .settings(&[AppSettings::GlobalVersion,
-                    AppSettings::SubcommandRequired])
-        // We use a subcommand because parsed after `cargo` is sent to the third party
-        // plugin
-        // which will be interpreted as a subcommand/positional arg by clap
-        .subcommand(SubCommand::with_name("outdated")
-            .about("Displays information about project dependency versions")
-            .args_from_usage(
-                "-p, --package [PKG]...     'Package to inspect for updates'
-                 -r, --root [ROOT]         'Package to treat as the root package'
-                 -v, --verbose              'Print verbose output'
-                 -d, --depth [NUM]          'How deep in the dependency chain to search \
-                                            (Defaults to all dependencies when omitted)'")
-            .args(&[
-                Arg::from_usage("--exit-code [NUM]     'The exit code to return on new versions found'")
-                    .default_value("0"),
-                Arg::from_usage(
-                    "-R, --root-deps-only  'Only check root dependencies (Equivalent to --depth=1)'")
-                    .conflicts_with("depth"),
-                Arg::from_usage("-m, --manifest-path [PATH] 'An absolute path to the Cargo.toml file to use \
-                                                             (Defaults to Cargo.toml in project root)'")
-                    .validator(is_file),
-                Arg::from_usage("-l, --lockfile-path [PATH] 'An absolute path to the Cargo.lock to use \
-                                                             (Defaults to Cargo.lock in project root)'")
-                    .validator(is_file)]))
-        .get_matches();
-
-    if let Some(m) = m.subcommand_matches("outdated") {
-        match execute(m) {
-            Ok(code) => {
-                debugln!("main:exit_code={}", code);
-                process::exit(code)
-            }
-            Err(e) => e.exit(),
+impl Options {
+    fn from_matches(m: &ArgMatches) -> Options {
+        Options {
+            flag_color: m.value_of("color").map(String::from),
+            flag_features: m.values_of("features")
+                .map(|vals| vals.into_iter().map(String::from).collect())
+                .unwrap_or_default(),
+            flag_all_features: m.is_present("all-features"),
+            flag_no_default_features: m.is_present("no-default-features"),
+            flag_manifest_path: m.value_of("manifest-path").map(String::from),
+            flag_quiet: Some(m.is_present("quiet")),
+            flag_verbose: m.occurrences_of("verbose") as u32,
+            flag_frozen: false,
+            flag_locked: false,
+            flag_exit_code: m.value_of("exit-code")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or_else(|| 0u32),
+            flag_packages: m.values_of("packages")
+                .map(|vals| vals.into_iter().map(String::from).collect())
+                .unwrap_or_default(),
+            flag_root: m.value_of("root").map(String::from),
         }
     }
 }
 
-fn execute(m: &ArgMatches) -> CliResult<i32> {
-    debugln!("execute:m={:#?}", m);
-    let cfg = try!(Config::from_matches(m));
+pub const USAGE: &'static str = "
+Displays information about project dependency versions
 
-    // parse original lockfile
-    verbose!(
-        cfg,
-        "Parsing {}...",
-        Format::Warning(cfg.lockfile.to_string_lossy())
-    );
-    let dep_tree_curr = {
-        let mut parsed_lock = cargo_files::Lockfile::from_lockfile_path(&cfg.lockfile)?;
-        if parsed_lock.package.is_none() {
-            return Err(CliError::NoRootDeps);
+USAGE:
+    cargo outdated [FLAGS] [OPTIONS]
+
+FLAGS:
+        --all-features           Check outdated packages with all features enabled
+    -h, --help                   Prints help information
+        --no-default-features    Do not include the `default` feature
+    -q, --quiet                  Coloring: auto, always, never
+    -R, --root-deps-only         Only check root dependencies (Equivalent to --depth=1)
+    -V, --version                Prints version information
+    -v, --verbose                Use verbose output
+
+OPTIONS:
+        --color <color>           Coloring: auto, always, never [values: auto, always, never]
+    -d, --depth <NUM>             How deep in the dependency chain to search
+                                  (Defaults to all dependencies when omitted)
+        --exit-code <NUM>         The exit code to return on new versions found [default: 0]
+        --features <FEATURE>      Space-separated list of features
+    -m, --manifest-path <PATH>    An absolute path to the Cargo.toml file to use
+                                  (Defaults to Cargo.toml in project root)
+    -p, --packages <PKG>          Package to inspect for updates
+    -r, --root <ROOT>             Package to treat as the root package
+";
+
+fn main() {
+    env_logger::init().unwrap();
+
+    let config = match Config::default() {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            let mut shell = cargo::shell(Verbosity::Verbose, ColorConfig::Auto);
+            cargo::exit_with_error(e.into(), &mut shell)
         }
-        parsed_lock
-            .package
-            .as_mut()
-            .unwrap()
-            .push(parsed_lock.root.clone());
-        cargo_files::DependencyTree::from_lockfile(&mut parsed_lock, cfg.root, cfg.depth)
     };
-    verboseln!(cfg, "{}", Format::Good("Done"));
-    // create a temp project in tmp
-    let tmp_proj = cargo_ops::TempProject::new(&cfg.manifest, &cfg.lockfile)?;
-    // write semver to the tmp Cargo.toml
-    tmp_proj.write_manifest_semver()?;
-    // update it
-    tmp_proj.cargo_update()?;
-    // parse lockfile with semver compatible dependencies
-    verbose!(
-        cfg,
-        "Parsing semver compatible lockfile {}...",
-        Format::Warning(tmp_proj.lockfile.to_string_lossy())
-    );
-    let dep_tree_compat = {
-        let mut parsed_lock = cargo_files::Lockfile::from_lockfile_path(&tmp_proj.lockfile)?;
-        parsed_lock
-            .package
-            .as_mut()
-            .unwrap()
-            .push(parsed_lock.root.clone());
-        cargo_files::DependencyTree::from_lockfile(&mut parsed_lock, cfg.root, -1)
-    };
-    verboseln!(cfg, "{}", Format::Good("Done"));
-    // rewrite the manifest with "*" semver dependencies
-    tmp_proj.write_manifest_latest()?;
-    // update it
-    tmp_proj.cargo_update()?;
-    // parse lockfile with latest dependencies
-    verbose!(
-        cfg,
-        "Parsing latest lockfile {}...",
-        Format::Warning(tmp_proj.lockfile.to_string_lossy())
-    );
-    let dep_tree_latest = {
-        let mut parsed_lock = cargo_files::Lockfile::from_lockfile_path(&tmp_proj.lockfile)?;
-        parsed_lock
-            .package
-            .as_mut()
-            .unwrap()
-            .push(parsed_lock.root.clone());
-        cargo_files::DependencyTree::from_lockfile(&mut parsed_lock, cfg.root, -1)
-    };
-    verboseln!(cfg, "{}", Format::Good("Done"));
 
-    let mut tw = TabWriter::new(vec![]);
-    write!(&mut tw, "Name\tProject Ver\tSemVer Compat\tLatest Ver\n")
-        .unwrap_or_else(|e| panic!("write! error: {}", e));
-    let lines = cargo_files::DependencyTree::print_list_to_vec(
-        &dep_tree_curr,
-        &dep_tree_compat,
-        &dep_tree_latest,
-        &cfg,
-    );
-    if lines.is_empty() {
-        println!("All dependencies are up to date, yay!");
-        return Ok(0);
+    let m = App::new("cargo-outdated")
+        .author("Kevin K. <kbknapp@gmail.com>")
+        .about("Displays information about project dependency versions")
+        .version(concat!("v", crate_version!()))
+        .bin_name("cargo")
+        .settings(&[
+            AppSettings::GlobalVersion,
+            AppSettings::SubcommandRequired,
+        ])
+        .subcommand(
+            SubCommand::with_name("outdated")
+                .about("Displays information about project dependency versions")
+                .arg(
+                    Arg::with_name("quiet")
+                        .long("quiet")
+                        .short("q")
+                        .help("Coloring: auto, always, never"),
+                )
+                .arg(
+                    Arg::with_name("color")
+                        .long("color")
+                        .help("Coloring: auto, always, never")
+                        .takes_value(true)
+                        .number_of_values(1)
+                        .possible_values(&["auto", "always", "never"]),
+                )
+                .arg(
+                    Arg::with_name("features")
+                        .long("features")
+                        .help("Space-separated list of features")
+                        .takes_value(true)
+                        .value_name("FEATURE")
+                        .value_delimiter(" ")
+                        .conflicts_with_all(&["all-features", "no-default-features"]),
+                )
+                .arg(
+                    Arg::with_name("all-features")
+                        .long("all-features")
+                        .help("Check outdated packages with all features enabled")
+                        .conflicts_with_all(&["features", "no-default-features"]),
+                )
+                .arg(
+                    Arg::with_name("no-default-features")
+                        .long("no-default-features")
+                        .help("Do not include the `default` feature")
+                        .conflicts_with_all(&["features", "all-features"]),
+                )
+                .arg(
+                    Arg::with_name("packages")
+                        .long("packages")
+                        .short("p")
+                        .help("Package to inspect for updates")
+                        .takes_value(true)
+                        .value_name("PKG")
+                        .value_delimiter(" "),
+                )
+                .arg(
+                    Arg::with_name("root")
+                        .long("root")
+                        .short("r")
+                        .help("Package to treat as the root package")
+                        .takes_value(true)
+                        .value_name("ROOT")
+                        .number_of_values(1),
+                )
+                .arg(
+                    Arg::with_name("verbose")
+                        .long("verbose")
+                        .short("v")
+                        .help("Use verbose output")
+                        .multiple(true),
+                )
+                .arg(
+                    Arg::with_name("depth")
+                        .long("depth")
+                        .short("d")
+                        .long_help(
+                            "How deep in the dependency chain to search \
+                             (Defaults to all dependencies when omitted)",
+                        )
+                        .takes_value(true)
+                        .value_name("NUM")
+                        .number_of_values(1),
+                )
+                .arg(
+                    Arg::with_name("exit-code")
+                        .long("exit-code")
+                        .help("The exit code to return on new versions found")
+                        .takes_value(true)
+                        .value_name("NUM")
+                        .number_of_values(1)
+                        .default_value("0"),
+                )
+                .arg(
+                    Arg::with_name("root-deps-only")
+                        .long("root-deps-only")
+                        .short("R")
+                        .help("Only check root dependencies (Equivalent to --depth=1)")
+                        .conflicts_with("depth"),
+                )
+                .arg(
+                    Arg::with_name("manifest-path")
+                        .long("manifest-path")
+                        .short("m")
+                        .long_help(
+                            "An absolute path to the Cargo.toml file to use \
+                             (Defaults to Cargo.toml in project root)",
+                        )
+                        .takes_value(true)
+                        .value_name("PATH")
+                        .number_of_values(1)
+                        .validator(is_file),
+                ),
+        )
+        .get_matches();
+    let m = m.subcommand_matches("outdated")
+        .expect("Subcommand outdated not found");
+    let options = Options::from_matches(&m);
+    let result = execute(options, &config);
+    match result {
+        Err(e) => cargo::exit_with_error(e, &mut *config.shell()),
+        Ok(()) => {}
     }
-    for l in lines {
-        try!(write!(&mut tw, "{}", l));
-    }
-    tw.flush()
-        .unwrap_or_else(|e| panic!("failed to flush TabWriter: {}", e));
-    write!(
-        stdout(),
-        "{}",
-        String::from_utf8(tw.into_inner().unwrap())
-            .unwrap_or_else(|e| panic!("from_utf8 error: {}", e))
-    ).unwrap_or_else(|e| panic!("write! error: {}", e));
+}
 
-    Ok(cfg.exit_code)
+pub fn execute(options: Options, config: &Config) -> CliResult {
+    config.configure(
+        options.flag_verbose,
+        options.flag_quiet,
+        &options.flag_color,
+        options.flag_frozen,
+        options.flag_locked,
+    )?;
+
+    let curr_workspace = {
+        let curr_manifest = find_root_manifest_for_wd(options.flag_manifest_path, config.cwd())?;
+        Workspace::new(&curr_manifest, config)?
+    };
+    let curr_specs = Packages::All.into_package_id_specs(&curr_workspace)?;
+    let (curr_packages, curr_resolve) = ops::resolve_ws_precisely(
+        &curr_workspace,
+        None,
+        &options.flag_features,
+        options.flag_all_features,
+        options.flag_no_default_features,
+        &curr_specs,
+    )?;
+
+    let compat_proj = TempProject::from_workspace(&curr_workspace, &config)?;
+    compat_proj.write_manifest_semver()?;
+    compat_proj.cargo_update()?;
+
+    let latest_proj = TempProject::from_workspace(&curr_workspace, &config)?;
+    latest_proj.write_manifest_latest()?;
+    latest_proj.cargo_update()?;
+
+    Ok(())
 }
 
 fn is_file(s: String) -> Result<(), String> {
